@@ -1,24 +1,17 @@
 import subprocess
 import clang.cindex as c
 from clang.cindex import CursorKind, TypeKind
+import glob
+import os
 
 C_MIN = -2147483648
 C_MAX = 2147483647
-
-# Preprocess the C file
-with open("out.i", "w", encoding="utf-8") as f:
-    subprocess.run(
-        ["clang", "-E", "-P", "main.c"],
-        stdout=f,
-        text=True
-    )
 
 c.Config.set_library_file(
     r"/Library/Developer/CommandLineTools/usr/lib/libclang.dylib"
 )
 
 index = c.Index.create()
-tu = index.parse("out.i")
 
 class DataFlowAnalyzer:
     def __init__(self):
@@ -28,6 +21,7 @@ class DataFlowAnalyzer:
         self.vars = {}
         # Track reported vulnerabilities by line to avoid duplicates during loop unrolling
         self.reported_vulns = set()
+
 
     def evaluate(self, node):
         """Recursively evaluate an expression to return a (min, max) range."""
@@ -214,18 +208,33 @@ class DataFlowAnalyzer:
         for child in node.get_children():
             self.visit(child)
 
-analyzer = DataFlowAnalyzer()
-analyzer.visit(tu.cursor)
+def analyze_file(file_path):
+    print(f"\n--- Analyzing {file_path} ---")
+    
+    # Preprocess the C file
+    with open("out.i", "w", encoding="utf-8") as f:
+        subprocess.run(
+            ["clang", "-E", "-P", file_path],
+            stdout=f,
+            text=True
+        )
 
-print("Final Variable State:", analyzer.vars)
-print("Final Arrays Tracking:", analyzer.arrays)
+    tu = index.parse("out.i")
+    
+    analyzer = DataFlowAnalyzer()
+    analyzer.visit(tu.cursor)
 
-# def print_ast(cursor: c.Cursor):
-#     print(f"Cursor: {cursor.type.kind}")
-#     for token in list(cursor.get_tokens()):
-#         print(f"{token.kind} {token.spelling} {token.kind}")
-#
-#     for child in cursor.get_children():
-#         print_ast(child)
-#
-# print_ast(tu.cursor)
+    print(f"Final Variable State ({os.path.basename(file_path)}):", analyzer.vars)
+    print(f"Final Arrays Tracking ({os.path.basename(file_path)}):", analyzer.arrays)
+
+def main():
+    c_files = glob.glob("*.c")
+    if not c_files:
+        print("No .c files found in the current directory.")
+        return
+        
+    for c_file in c_files:
+        analyze_file(c_file)
+
+if __name__ == "__main__":
+    main()
