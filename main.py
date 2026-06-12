@@ -25,6 +25,10 @@ class CallGraphAnalyzer:
         self.array_stack = []     # List of dictionaries for local arrays
         self.reported_vulns = set()
         self.return_val = (C_MIN, C_MAX)
+        
+        # Heap tracking
+        self.heap_allocations = {} # Maps ID -> size: { 'heap_1': 20 }
+        self.next_heap_id = 1
 
     def get_var(self, name):
         if self.call_stack and name in self.call_stack[-1]:
@@ -88,6 +92,11 @@ class CallGraphAnalyzer:
             if len(children) != 2: return (C_MIN, C_MAX)
             lhs_range = self.evaluate(children[0])
             rhs_range = self.evaluate(children[1])
+            
+            # Prevent crashing if we try to do math on a pointer ID
+            if isinstance(lhs_range, str) or isinstance(rhs_range, str):
+                return (C_MIN, C_MAX)
+
             tokens = list(node.get_tokens())
             lhs_tokens = list(children[0].get_tokens())
             if len(lhs_tokens) < len(tokens):
@@ -104,6 +113,7 @@ class CallGraphAnalyzer:
         elif node.kind in (CursorKind.UNEXPOSED_EXPR, CursorKind.PAREN_EXPR):
             children = list(node.get_children())
             if children:
+                # If the unexposed expr wraps a function call or ref, evaluate it
                 return self.evaluate(children[0])
         elif node.kind == CursorKind.UNARY_OPERATOR:
             tokens = list(node.get_tokens())
@@ -128,6 +138,17 @@ class CallGraphAnalyzer:
             
         if not func_name and node.spelling:
             func_name = node.spelling
+
+        if func_name == "malloc":
+            if args_nodes:
+                size_range = self.evaluate(args_nodes[0])
+                if not isinstance(size_range, str): # Safety check
+                    heap_id = f"heap_{self.next_heap_id}"
+                    self.next_heap_id += 1
+                    # In a real system, we'd divide by sizeof(type). We'll store raw bytes/elements
+                    self.heap_allocations[heap_id] = size_range[1]
+                    return heap_id
+            return (C_MIN, C_MAX)
 
         if func_name in self.function_map:
             func_cursor = self.function_map[func_name]
@@ -166,7 +187,7 @@ class CallGraphAnalyzer:
         if node.kind == CursorKind.VAR_DECL:
             if node.type.kind == TypeKind.CONSTANTARRAY:
                 self.set_array(node.spelling, node.type.element_count)
-            elif node.type.kind == TypeKind.INT:
+            elif node.type.kind in (TypeKind.INT, TypeKind.POINTER):
                 children = list(node.get_children())
                 if children: 
                     self.set_var(node.spelling, self.evaluate(children[0]))
@@ -205,17 +226,27 @@ class CallGraphAnalyzer:
                 else:
                     array_name = array_node.spelling
 
-                idx_min, idx_max = self.evaluate(index_node)
-                size = self.get_array(array_name)
+                idx_range = self.evaluate(index_node)
                 
-                if size is not None:
-                    if idx_max >= size or idx_min < 0:
-                        file_name = node.location.file.name if node.location.file else "unknown"
-                        file_base = os.path.basename(file_name)
-                        vuln_key = f"{file_base}:{array_name}:{node.location.line}"
-                        if vuln_key not in self.reported_vulns:
-                            print(f"[!] Vulnerability: Buffer overflow detected in {file_base}. Array '{array_name}' size {size}, accessed at index [{idx_min}, {idx_max}] (Line {node.location.line})")
-                            self.reported_vulns.add(vuln_key)
+                if isinstance(idx_range, tuple):
+                    idx_min, idx_max = idx_range
+                    
+                    size = self.get_array(array_name)
+                    
+                    if size is None:
+                        # Check if it's a pointer to the heap
+                        pointer_val = self.get_var(array_name)
+                        if isinstance(pointer_val, str) and pointer_val.startswith("heap_"):
+                            size = self.heap_allocations.get(pointer_val)
+                    
+                    if size is not None:
+                        if idx_max >= size or idx_min < 0:
+                            file_name = node.location.file.name if node.location.file else "unknown"
+                            file_base = os.path.basename(file_name)
+                            vuln_key = f"{file_base}:{array_name}:{node.location.line}"
+                            if vuln_key not in self.reported_vulns:
+                                print(f"[!] Vulnerability: Buffer overflow detected in {file_base}. Array '{array_name}' size {size}, accessed at index [{idx_min}, {idx_max}] (Line {node.location.line})")
+                                self.reported_vulns.add(vuln_key)
 
         elif node.kind in (CursorKind.FOR_STMT, CursorKind.WHILE_STMT):
             children = list(node.get_children())
@@ -243,7 +274,10 @@ class CallGraphAnalyzer:
                 for var in all_vars:
                     val_new = self.call_stack[-1].get(var, (C_MIN, C_MAX))
                     val_prev = prev_iter_state.get(var, (C_MIN, C_MAX))
-                    merged_state[var] = (min(val_new[0], val_prev[0]), max(val_new[1], val_prev[1]))
+                    if isinstance(val_new, tuple) and isinstance(val_prev, tuple):
+                        merged_state[var] = (min(val_new[0], val_prev[0]), max(val_new[1], val_prev[1]))
+                    else:
+                         merged_state[var] = val_new if val_new == val_prev else (C_MIN, C_MAX)
                 self.call_stack[-1] = merged_state
                 
                 if prev_iter_state == self.call_stack[-1]:
@@ -255,10 +289,11 @@ class CallGraphAnalyzer:
                     if prev_iter_state.get(var) != self.call_stack[-1][var]:
                         val = self.call_stack[-1][var]
                         old = prev_iter_state.get(var, (0, 0))
-                        new_min = C_MIN if val[0] < old[0] else val[0]
-                        new_max = C_MAX if val[1] > old[1] else val[1]
-                        self.call_stack[-1][var] = (new_min, new_max)
-                        widened = True
+                        if isinstance(val, tuple) and isinstance(old, tuple):
+                            new_min = C_MIN if val[0] < old[0] else val[0]
+                            new_max = C_MAX if val[1] > old[1] else val[1]
+                            self.call_stack[-1][var] = (new_min, new_max)
+                            widened = True
                 if widened:
                     for child in loop_body_children:
                         self.visit(child)
@@ -288,7 +323,13 @@ class CallGraphAnalyzer:
                 for var in all_vars:
                     val_t = true_state.get(var, original_state.get(var, (C_MIN, C_MAX)))
                     val_f = false_state.get(var, original_state.get(var, (C_MIN, C_MAX)))
-                    merged_state[var] = (min(val_t[0], val_f[0]), max(val_t[1], val_f[1]))
+                    
+                    if isinstance(val_t, tuple) and isinstance(val_f, tuple):
+                        merged_state[var] = (min(val_t[0], val_f[0]), max(val_t[1], val_f[1]))
+                    elif val_t == val_f:
+                        merged_state[var] = val_t # Preserve pointer ID if unchanged
+                    else:
+                        merged_state[var] = (C_MIN, C_MAX) # Lost track
                 
                 self.call_stack[-1] = merged_state
                 return
