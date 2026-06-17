@@ -10,7 +10,6 @@ class TestCallGraphAnalyzer(unittest.TestCase):
         self.analyzer = CallGraphAnalyzer()
         # Push a global frame for basic tests (simulates being inside a function)
         self.analyzer.call_stack.append({})
-        self.analyzer.array_stack.append({})
 
     def parse_and_visit(self, code):
         """Helper to parse a C string and visit its AST."""
@@ -31,7 +30,6 @@ class TestCallGraphAnalyzer(unittest.TestCase):
     def test_state_management(self):
         """Test getting and setting variables/arrays across stack frames."""
         self.analyzer.call_stack = []
-        self.analyzer.array_stack = []
         
         # Global scope
         self.analyzer.set_var("global_v", (1, 1))
@@ -96,7 +94,6 @@ class TestCallGraphAnalyzer(unittest.TestCase):
         
         # 1. Build Index (Phase 1)
         self.analyzer.call_stack = []
-        self.analyzer.array_stack = []
         self.analyzer.build_index(tu.cursor)
         self.assertIn("add", self.analyzer.function_map)
         self.assertIn("test", self.analyzer.function_map)
@@ -104,7 +101,6 @@ class TestCallGraphAnalyzer(unittest.TestCase):
         # 2. Setup call stack and analyze `test` (Phase 2)
         test_func = self.analyzer.function_map["test"]
         self.analyzer.call_stack.append({})
-        self.analyzer.array_stack.append({})
         
         for c in test_func.get_children():
             if c.kind == CursorKind.COMPOUND_STMT:
@@ -123,6 +119,36 @@ class TestCallGraphAnalyzer(unittest.TestCase):
         # Ensure a vulnerability was logged containing the pointer name 'p'
         vuln_found = any("p" in vuln for vuln in self.analyzer.reported_vulns)
         self.assertTrue(vuln_found, "Heap buffer overflow should have been detected on pointer 'p'.")
+
+    def test_interprocedural_array_pass(self):
+        """Test that a regular array passed to a function decays to a tracked pointer."""
+        code = """
+        void process_array(int *ptr) { ptr[10] = 42; }
+        void test() { int arr[5]; process_array(arr); }
+        """
+        with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
+            f.write(code)
+            temp_name = f.name
+            
+        tu = index.parse(temp_name)
+        
+        self.analyzer.call_stack = []
+        self.analyzer.build_index(tu.cursor)
+        self.assertIn("process_array", self.analyzer.function_map)
+        self.assertIn("test", self.analyzer.function_map)
+        
+        test_func = self.analyzer.function_map["test"]
+        self.analyzer.call_stack.append({})
+        
+        for c in test_func.get_children():
+            if c.kind == CursorKind.COMPOUND_STMT:
+                self.analyzer.visit(c)
+                
+        os.remove(temp_name)
+        
+        # Ensure a vulnerability was logged containing the pointer/array name
+        vuln_found = any("ptr" in vuln for vuln in self.analyzer.reported_vulns)
+        self.assertTrue(vuln_found, "Interprocedural array overflow should have been detected.")
 
 if __name__ == '__main__':
     unittest.main()

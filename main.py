@@ -18,17 +18,15 @@ class CallGraphAnalyzer:
     def __init__(self):
         self.function_map = {}
         self.global_vars = {}
-        self.global_arrays = {}
         self.tus = []
 
         self.call_stack = []      # List of dictionaries for local vars
-        self.array_stack = []     # List of dictionaries for local arrays
         self.reported_vulns = set()
         self.return_val = (C_MIN, C_MAX)
         
-        # Heap tracking
-        self.heap_allocations = {} # Maps ID -> size: { 'heap_1': 20 }
-        self.next_heap_id = 1
+        # Unified allocation tracking (for heap and arrays)
+        self.allocations = {} # Maps ID -> size: { 'alloc_1': 20 }
+        self.next_alloc_id = 1
 
     def get_var(self, name):
         if self.call_stack and name in self.call_stack[-1]:
@@ -45,17 +43,6 @@ class CallGraphAnalyzer:
         else:
             self.global_vars[name] = val
 
-    def get_array(self, name):
-        if self.array_stack and name in self.array_stack[-1]:
-            return self.array_stack[-1][name]
-        return self.global_arrays.get(name, None)
-
-    def set_array(self, name, size):
-        if self.array_stack is not None and len(self.array_stack) > 0:
-            self.array_stack[-1][name] = size
-        else:
-            self.global_arrays[name] = size
-
     def build_index(self, cursor):
         if cursor.kind == CursorKind.FUNCTION_DECL:
             if cursor.is_definition():
@@ -63,7 +50,10 @@ class CallGraphAnalyzer:
         elif cursor.kind == CursorKind.VAR_DECL:
             if cursor.lexical_parent and cursor.lexical_parent.kind == CursorKind.TRANSLATION_UNIT:
                 if cursor.type.kind == TypeKind.CONSTANTARRAY:
-                    self.global_arrays[cursor.spelling] = cursor.type.element_count
+                    alloc_id = f"alloc_{self.next_alloc_id}"
+                    self.next_alloc_id += 1
+                    self.allocations[alloc_id] = cursor.type.element_count
+                    self.global_vars[cursor.spelling] = alloc_id
                 elif cursor.type.kind == TypeKind.INT:
                     children = list(cursor.get_children())
                     if children:
@@ -143,11 +133,11 @@ class CallGraphAnalyzer:
             if args_nodes:
                 size_range = self.evaluate(args_nodes[0])
                 if not isinstance(size_range, str): # Safety check
-                    heap_id = f"heap_{self.next_heap_id}"
-                    self.next_heap_id += 1
+                    alloc_id = f"alloc_{self.next_alloc_id}"
+                    self.next_alloc_id += 1
                     # In a real system, we'd divide by sizeof(type). We'll store raw bytes/elements
-                    self.heap_allocations[heap_id] = size_range[1]
-                    return heap_id
+                    self.allocations[alloc_id] = size_range[1]
+                    return alloc_id
             return (C_MIN, C_MAX)
 
         if func_name in self.function_map:
@@ -164,7 +154,6 @@ class CallGraphAnalyzer:
                     new_frame[param.spelling] = (C_MIN, C_MAX)
             
             self.call_stack.append(new_frame)
-            self.array_stack.append({})
             
             old_return = self.return_val
             self.return_val = (C_MIN, C_MAX)
@@ -176,7 +165,6 @@ class CallGraphAnalyzer:
             ret_val = self.return_val
             
             self.call_stack.pop()
-            self.array_stack.pop()
             self.return_val = old_return
             
             return ret_val
@@ -186,7 +174,10 @@ class CallGraphAnalyzer:
     def visit(self, node):
         if node.kind == CursorKind.VAR_DECL:
             if node.type.kind == TypeKind.CONSTANTARRAY:
-                self.set_array(node.spelling, node.type.element_count)
+                alloc_id = f"alloc_{self.next_alloc_id}"
+                self.next_alloc_id += 1
+                self.allocations[alloc_id] = node.type.element_count
+                self.set_var(node.spelling, alloc_id)
             elif node.type.kind in (TypeKind.INT, TypeKind.POINTER):
                 children = list(node.get_children())
                 if children: 
@@ -226,27 +217,22 @@ class CallGraphAnalyzer:
                 else:
                     array_name = array_node.spelling
 
+                pointer_val = self.evaluate(array_node)
                 idx_range = self.evaluate(index_node)
                 
                 if isinstance(idx_range, tuple):
                     idx_min, idx_max = idx_range
                     
-                    size = self.get_array(array_name)
-                    
-                    if size is None:
-                        # Check if it's a pointer to the heap
-                        pointer_val = self.get_var(array_name)
-                        if isinstance(pointer_val, str) and pointer_val.startswith("heap_"):
-                            size = self.heap_allocations.get(pointer_val)
-                    
-                    if size is not None:
-                        if idx_max >= size or idx_min < 0:
-                            file_name = node.location.file.name if node.location.file else "unknown"
-                            file_base = os.path.basename(file_name)
-                            vuln_key = f"{file_base}:{array_name}:{node.location.line}"
-                            if vuln_key not in self.reported_vulns:
-                                print(f"[!] Vulnerability: Buffer overflow detected in {file_base}. Array '{array_name}' size {size}, accessed at index [{idx_min}, {idx_max}] (Line {node.location.line})")
-                                self.reported_vulns.add(vuln_key)
+                    if isinstance(pointer_val, str) and pointer_val.startswith("alloc_"):
+                        size = self.allocations.get(pointer_val)
+                        if size is not None:
+                            if idx_max >= size or idx_min < 0:
+                                file_name = node.location.file.name if node.location.file else "unknown"
+                                file_base = os.path.basename(file_name)
+                                vuln_key = f"{file_base}:{array_name}:{node.location.line}"
+                                if vuln_key not in self.reported_vulns:
+                                    print(f"[!] Vulnerability: Buffer overflow detected in {file_base}. Array '{array_name}' size {size}, accessed at index [{idx_min}, {idx_max}] (Line {node.location.line})")
+                                    self.reported_vulns.add(vuln_key)
 
         elif node.kind in (CursorKind.FOR_STMT, CursorKind.WHILE_STMT):
             children = list(node.get_children())
@@ -364,7 +350,6 @@ class CallGraphAnalyzer:
              return
              
         self.call_stack.append({})
-        self.array_stack.append({})
         
         main_cursor = self.function_map["main"]
         for c in main_cursor.get_children():
