@@ -150,5 +150,38 @@ class TestCallGraphAnalyzer(unittest.TestCase):
         vuln_found = any("ptr" in vuln for vuln in self.analyzer.reported_vulns)
         self.assertTrue(vuln_found, "Interprocedural array overflow should have been detected.")
 
+    def test_pointer_aliasing(self):
+        """Test that pointer aliasing properly propagates the allocation ID."""
+        code = "void test() { int arr[5]; int *p = arr; int *q = p; q[10] = 42; }"
+        self.parse_and_visit(code)
+        
+        vuln_found = any("q" in vuln for vuln in self.analyzer.reported_vulns)
+        self.assertTrue(vuln_found, "Pointer aliasing overflow should have been detected.")
+
+    def test_global_array_access(self):
+        """Test overflow detection on global arrays."""
+        code = "int g_arr[5]; void test() { g_arr[10] = 1; }"
+        
+        with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
+            f.write(code)
+            temp_name = f.name
+            
+        tu = index.parse(temp_name)
+        
+        self.analyzer.call_stack = []
+        self.analyzer.build_index(tu.cursor)
+        
+        test_func = self.analyzer.function_map["test"]
+        self.analyzer.call_stack.append({})
+        
+        for c in test_func.get_children():
+            if c.kind == CursorKind.COMPOUND_STMT:
+                self.analyzer.visit(c)
+                
+        os.remove(temp_name)
+        
+        vuln_found = any("g_arr" in vuln for vuln in self.analyzer.reported_vulns)
+        self.assertTrue(vuln_found, "Global array overflow should have been detected.")
+
 if __name__ == '__main__':
     unittest.main()
